@@ -1,9 +1,10 @@
 import os
 import sys
+import datetime
 import warnings
 from dotenv import load_dotenv
 
-# Suppress noisy background deprecation alerts
+# Suppress background deprecation warnings cleanly
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -12,108 +13,108 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from pymongo import MongoClient
 
-# Ingest environment credentials from .env
+# Load environmental variables
 load_dotenv()
 
 def auto_discover_gemini_model() -> str:
-    """
-    Programmatically lists all active models available for the provided API key
-    and returns the best available text generation model automatically.
-    """
+    """Programmatically discovers the best text generation model for the API key."""
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("\n❌ [Discovery Error] Missing API Key in environment variables.")
-        print("👉 Please populate GOOGLE_API_KEY inside your local .env file.\n")
         sys.exit(1)
 
-    print("[Query Engine] Interrogating Google AI Studio endpoint for dynamic model discovery...")
     try:
-        # Initialize the native Google GenAI SDK client
         from google import genai
         client = genai.Client(api_key=api_key)
-        
         discovered_text_models = []
-        # Query the active models endpoint
         for model_meta in client.models.list():
             if "generateContent" in model_meta.supported_actions:
-                # Strip the prefix 'models/' to match standard string formatting
-                short_name = model_meta.name.replace("models/", "")
-                discovered_text_models.append(short_name)
+                discovered_text_models.append(model_meta.name.replace("models/", ""))
         
-        # Define a prioritized preference cascade matching active models
-        preference_cascade = [
-            "gemini-2.5-flash",
-            "gemini-3.5-flash", 
-            "gemini-2.0-flash", 
-            "gemini-1.5-flash",
-            "gemini-pro"
-        ]
-        
+        preference_cascade = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
         for priority_target in preference_cascade:
             if priority_target in discovered_text_models:
-                print(f"🎯 Auto-Selected Active Model: '{priority_target}'")
                 return priority_target
-                
-        # If no preferred targets found, fall back to any available generation model
         if discovered_text_models:
-            print(f"🎯 Auto-Selected Discovered Model: '{discovered_text_models[0]}'")
             return discovered_text_models[0]
-            
-    except Exception as e:
-        print(f"⚠️ [Discovery Warning] Programmatic listing failed or unauthorized: {e}")
-    
-    # Global ultimate safe fallback string if endpoint discovery is rate-limited
-    print("👉 Falling back to standard default model path: 'gemini-2.5-flash'")
+    except Exception:
+        pass
     return "gemini-2.5-flash"
 
 
 def format_docs(docs):
-    """Combines extracted page snippets into a single unified context block."""
+    """Combines extracted page snippets into a single context block."""
     return "\n\n".join(doc.page_content for doc in docs)
 
 
+def log_transaction_to_mongodb(question: str, answer: str, source_documents: list):
+    """
+    Connects to the local Docker MongoDB container and saves a structured
+    historical log entry of the conversation and context audit trail.
+    """
+    try:
+        # Connect to local container port
+        client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
+        db = client["docuquery_db"]
+        logs_collection = db["conversation_history"]
+        
+        # Build out clear citation metadata arrays
+        citations = []
+        for doc in source_documents:
+            citations.append({
+                "source_file": os.path.basename(doc.metadata.get("source", "Unknown")),
+                "page": doc.metadata.get("page", 0) + 1,
+                "text_snippet": doc.page_content[:200].strip()
+            })
+            
+        # Structure payload object matching roadmap requirements
+        log_entry = {
+            "timestamp": datetime.datetime.utcnow(),
+            "user_question": question,
+            "generated_response": answer,
+            "audit_trail_citations": citations
+        }
+        
+        # Insert record into database space
+        logs_collection.insert_one(log_entry)
+        print("💾 [MongoDB] Transaction entry and context references archived successfully.")
+    except Exception as e:
+        print(f"⚠️ [MongoDB Log Warning] Failed to persist log entry to database: {e}")
+
+
 def run_audit_query(user_question: str, vector_store_dir: str = "faiss_index"):
-    """
-    Loads the unified FAISS index, retrieves contextual elements via semantic matching,
-    and constructs an LCEL pipe flow querying the auto-discovered Gemini model.
-    """
+    """Loads FAISS index, matches contexts, passes to LLM, and records trail to MongoDB."""
     if not os.path.exists(vector_store_dir):
-        print(f"[Query Error] Vector index database not found at '{vector_store_dir}'. Run ingest.py first!")
+        print(f"[Query Error] Vector index database not found. Run ingest.py first!")
         return
 
-    # Step 1: Initialize local sentence-embeddings transformer
-    print("[Query Engine] Loading local embedding model into memory...")
+    # Step 1: Initialize local embeddings
     embedding_engine = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-mpnet-base-v2",
         model_kwargs={'device': 'cpu'}
     )
 
-    # Step 2: Deserialization index maps safely from disk
-    print("[Query Engine] Deserializing local FAISS index footprint...")
-    db = FAISS.load_local(
-        vector_store_dir, 
-        embedding_engine, 
-        allow_dangerous_deserialization=True
-    )
+    # Step 2: Load local vector store
+    db = FAISS.load_local(vector_store_dir, embedding_engine, allow_dangerous_deserialization=True)
     retriever = db.as_retriever(search_kwargs={"k": 3})
 
-    # Step 3: Run Dynamic Model Discovery 
+    # Step 3: Auto-select model string and load Gemini
     target_model_string = auto_discover_gemini_model()
-
-    # Step 4: Establish connection to Google AI Studio Gemini API via discovered string
+    print(f"[Query Engine] Executing via discovered engine target: '{target_model_string}'")
+    
     llm = ChatGoogleGenerativeAI(
         model=target_model_string,
-        temperature=0.1, 
+        temperature=0.1,
         google_api_key=os.getenv("GOOGLE_API_KEY")
     )
 
-    # Step 5: Define prompt guidelines
+    # Step 4: System Prompt Framework
     system_prompt = (
         "You are a professional legal and financial audit assistant.\n"
         "Analyze the retrieved document context pieces below and provide a concise response.\n"
-        "If you do not know the answer or if it is not explicitly mentioned in the context, "
-        "state cleanly that the document does not contain the necessary information. Do not make anything up.\n\n"
+        "If you do not know the answer, state that the document does not contain the information. Do not hallucinate.\n\n"
         "Retrieved Document Context:\n"
         "{context}"
     )
@@ -122,7 +123,7 @@ def run_audit_query(user_question: str, vector_store_dir: str = "faiss_index"):
         ("human", "{input}"),
     ])
 
-    # Step 6: Assemble the LCEL RAG Chain
+    # Step 5: Assemble modern LCEL RAG Pipe Chain
     rag_chain = (
         {"context": retriever | format_docs, "input": RunnablePassthrough()}
         | prompt
@@ -130,20 +131,17 @@ def run_audit_query(user_question: str, vector_store_dir: str = "faiss_index"):
         | StrOutputParser()
     )
 
-    print(f"\n[Query] Executing search across database logs for: '{user_question}'")
+    # Step 6: Invoke and Parse Data Streams
     retrieved_documents = retriever.invoke(user_question)
     answer = rag_chain.invoke(user_question)
 
     print("\n🚀 --- Grounded Audit Response ---")
     print(answer)
+    print("----------------------------------\n")
     
-    print("\n📝 --- Source Citations & Audit Trail ---")
-    for idx, doc in enumerate(retrieved_documents):
-        page_num = doc.metadata.get("page", 0) + 1
-        source_file = os.path.basename(doc.metadata.get("source", "Unknown"))
-        print(f"[{idx + 1}] Source Doc: {source_file} | Page Link: {page_num}")
-        print(f"    Content Snippet: {doc.page_content[:120].strip()}...")
+    # Step 7: Log everything straight into MongoDB database index
+    log_transaction_to_mongodb(user_question, answer, retrieved_documents)
 
 if __name__ == "__main__":
-    test_query = "What are the core guidelines or maintenance rules mentioned?"
-    run_audit_query(test_query)
+    query = "What are the core guidelines or maintenance rules mentioned?"
+    run_audit_query(query)
